@@ -33,6 +33,13 @@ import { Discussion } from './entities/discussion.entity';
 export class DiscussionService {
   private readonly logger = new Logger(DiscussionService.name);
 
+  // Configuration constants
+  private static readonly MAX_CONTENT_LENGTH = 10000;
+  private static readonly MAX_TAGS_COUNT = 10;
+  private static readonly MAX_TAG_LENGTH = 50;
+  private static readonly DEFAULT_PAGE_SIZE = 10;
+  private static readonly MAX_PAGE_SIZE = 100;
+
   constructor(
     @InjectRepository(Discussion)
     private readonly discussionRepository: Repository<Discussion>,
@@ -47,7 +54,16 @@ export class DiscussionService {
     private readonly webSocketGateway: WebsocketGateway,
   ) {}
 
-  // ------ Discussion CRUD Operations ------
+  // ==================== CORE CRUD OPERATIONS ====================
+
+  /**
+   * Create a new discussion
+   * @param createDiscussionDto - Discussion creation data
+   * @param currentUser - Current authenticated user
+   * @param files - Optional file attachments
+   * @returns Created discussion
+   * @throws BadRequestException if user information is missing or space not found
+   */
 
   async create(
     createDiscussionDto: CreateDiscussionDto,
@@ -58,18 +74,17 @@ export class DiscussionService {
       throw new BadRequestException('User information is required');
     }
 
+    this.logger.log(`Creating discussion for user: ${currentUser.id}`);
+
+    // Validate input data
+    await this.validateDiscussionCreationData(createDiscussionDto, files);
+
     const createdFilePaths: string[] = [];
 
     try {
       // Validate space if provided
       if (createDiscussionDto.spaceId) {
-        const space = await this.spaceRepository.findOne({
-          where: { id: createDiscussionDto.spaceId },
-        });
-
-        if (!space) {
-          throw new NotFoundException(`Discussion space with ID ${createDiscussionDto.spaceId} not found`);
-        }
+        await this.validateSpaceExists(createDiscussionDto.spaceId);
       }
 
       const queryRunner = this.discussionRepository.manager.connection.createQueryRunner();
@@ -85,7 +100,7 @@ export class DiscussionService {
           downvoteCount: 0,
         });
 
-        // Process tags if provided (lowercase, remove duplicates, remove empty strings)
+        // Process tags if provided
         if (createDiscussionDto.tags && createDiscussionDto.tags.length > 0) {
           discussion.tags = this.processTags(createDiscussionDto.tags);
         }
@@ -107,24 +122,17 @@ export class DiscussionService {
 
         await queryRunner.commitTransaction();
 
-        // Handle websocket
+        // Handle websocket notification
         this.webSocketGateway.notifyNewDiscussion(currentUser.id, savedDiscussion.id, savedDiscussion.spaceId);
 
-        // Handle record activity
-        await this.analyticService.recordActivity(
-          currentUser.id,
-          ActivityType.CREATE_DISCUSSION,
-          ActivityEntityType.DISCUSSION,
-          savedDiscussion.id,
-          {
-            spaceId: savedDiscussion.spaceId,
-            isAnonymous: savedDiscussion.isAnonymous,
-            hasTags: (discussion.tags?.length || 0) > 0,
-            hasAttachments: files && files.length > 0,
-          },
-        );
+        // Record analytics
+        await this.recordDiscussionActivity(currentUser.id, ActivityType.CREATE_DISCUSSION, savedDiscussion, {
+          hasTags: (discussion.tags?.length || 0) > 0,
+          hasAttachments: files && files.length > 0,
+        });
 
         const createdDiscussion = await this.getDiscussionById(savedDiscussion.id);
+        this.logger.log(`Successfully created discussion with ID: ${savedDiscussion.id}`);
 
         return DiscussionResponseDto.fromEntity(createdDiscussion, currentUser);
       } catch (error) {
@@ -139,7 +147,15 @@ export class DiscussionService {
     }
   }
 
+  /**
+   * Find all discussions with pagination and filtering
+   * @param searchDto - Search and pagination parameters
+   * @param currentUser - Current authenticated user for personalized data
+   * @returns Paginated list of discussions
+   */
   async findAll(searchDto: SearchDiscussionDto, currentUser?: User): Promise<Pageable<DiscussionResponseDto>> {
+    this.logger.debug(`Finding discussions with search params: ${JSON.stringify(searchDto)}`);
+
     const { page, limit } = searchDto;
     const offset = (page - 1) * limit;
 
@@ -148,29 +164,24 @@ export class DiscussionService {
 
     await this.loadAttachmentsForDiscussions(discussions);
 
-    const responseItems = await Promise.all(
-      discussions.map(async (discussion) => {
-        let isBookmarked: boolean = false;
-        let voteStatus: number | null = null;
+    const responseItems = await this.buildDiscussionResponseItems(discussions, currentUser);
 
-        if (currentUser) {
-          const [bookmarkStatus, userVote] = await Promise.all([
-            this.isDiscussionBookmarked(discussion.id, currentUser.id),
-            this.voteService.getUserVoteStatus(currentUser.id, VoteEntityType.DISCUSSION, discussion.id),
-          ]);
+    const result = this.createPaginatedResponse(responseItems, totalItems, page, limit);
 
-          isBookmarked = bookmarkStatus;
-          voteStatus = userVote;
-        }
-
-        return DiscussionResponseDto.fromEntity(discussion, currentUser, isBookmarked, voteStatus);
-      }),
-    );
-
-    return this.createPaginatedResponse(responseItems, totalItems, page, limit);
+    this.logger.debug(`Found ${discussions.length} discussions out of ${totalItems} total`);
+    return result;
   }
 
+  /**
+   * Find discussion by ID
+   * @param id - Discussion ID
+   * @param currentUser - Current authenticated user for personalized data
+   * @returns Discussion details
+   * @throws NotFoundException if discussion not found
+   */
   async findById(id: number, currentUser?: User): Promise<DiscussionResponseDto> {
+    this.logger.debug(`Finding discussion by ID: ${id}`);
+
     const discussion = await this.getDiscussionById(id);
     const isBookmarked = currentUser ? await this.isDiscussionBookmarked(discussion.id, currentUser.id) : false;
     const voteStatus = currentUser
@@ -179,6 +190,17 @@ export class DiscussionService {
 
     return DiscussionResponseDto.fromEntity(discussion, currentUser, isBookmarked, voteStatus);
   }
+
+  /**
+   * Update an existing discussion
+   * @param id - Discussion ID
+   * @param updateDiscussionDto - Update data
+   * @param currentUser - Current authenticated user
+   * @param files - Optional new file attachments
+   * @returns Updated discussion
+   * @throws ForbiddenException if user doesn't own the discussion
+   * @throws NotFoundException if discussion not found
+   */
 
   async update(
     id: number,
@@ -189,7 +211,7 @@ export class DiscussionService {
     let createdFilePaths: string[] = [];
 
     try {
-      const discussion = await this.validateDiscussionAccess(id, currentUser.id);
+      const discussion = await this.validateDiscussionAccess(id, currentUser.id, currentUser.role);
       const existingAttachments = await this.attachmentService.getAttachmentsByEntity(AttachmentType.DISCUSSION, id);
 
       // Validate attachment limits
@@ -288,7 +310,16 @@ export class DiscussionService {
     }
   }
 
+  /**
+   * Delete an existing discussion (soft delete)
+   * @param id - Discussion ID
+   * @param currentUser - Current authenticated user (optional for admin operations)
+   * @throws ForbiddenException if user doesn't own the discussion and isn't admin
+   * @throws NotFoundException if discussion not found
+   */
   async delete(id: number, currentUser?: User): Promise<void> {
+    this.logger.log(`Deleting discussion: ${id}`);
+
     if (currentUser) {
       await this.validateDiscussionAccess(id, currentUser.id, currentUser.role);
     }
@@ -304,9 +335,20 @@ export class DiscussionService {
         { softDelete: true },
       );
     }
+
+    this.logger.log(`Successfully deleted discussion: ${id}`);
   }
 
+  /**
+   * Permanently delete a discussion (hard delete)
+   * @param id - Discussion ID
+   * @param currentUser - Current authenticated user
+   * @throws ForbiddenException if user doesn't own the discussion
+   * @throws NotFoundException if discussion not found
+   */
   async hardDelete(id: number, currentUser: User): Promise<void> {
+    this.logger.log(`Hard deleting discussion: ${id}`);
+
     const discussion = await this.validateDiscussionAccess(id, currentUser.id);
 
     const queryRunner = this.discussionRepository.manager.connection.createQueryRunner();
@@ -315,10 +357,10 @@ export class DiscussionService {
 
     try {
       await this.attachmentService.deleteAttachmentsByEntity(AttachmentType.DISCUSSION, id);
-
       await queryRunner.manager.remove(discussion);
-
       await queryRunner.commitTransaction();
+
+      this.logger.log(`Successfully hard deleted discussion: ${id}`);
     } catch (error) {
       await queryRunner.rollbackTransaction();
       throw error;
@@ -327,9 +369,17 @@ export class DiscussionService {
     }
   }
 
-  // ------ Bookmark Operations ------
+  // ==================== BOOKMARK OPERATIONS ====================
 
+  /**
+   * Add a discussion to user's bookmarks
+   * @param discussionId - Discussion ID to bookmark
+   * @param userId - User ID
+   * @throws NotFoundException if discussion not found
+   */
   async bookmarkDiscussion(discussionId: number, userId: number): Promise<void> {
+    this.logger.debug(`Bookmarking discussion ${discussionId} for user ${userId}`);
+
     // Validate discussion exists
     const discussion = await this.getDiscussionById(discussionId);
 
@@ -357,10 +407,20 @@ export class DiscussionService {
           authorId: discussion.authorId,
         },
       );
+
+      this.logger.debug(`Successfully bookmarked discussion ${discussionId} for user ${userId}`);
     }
   }
 
+  /**
+   * Remove a discussion from user's bookmarks
+   * @param discussionId - Discussion ID to unbookmark
+   * @param userId - User ID
+   * @throws NotFoundException if discussion or bookmark not found
+   */
   async unbookmarkDiscussion(discussionId: number, userId: number): Promise<void> {
+    this.logger.debug(`Unbookmarking discussion ${discussionId} for user ${userId}`);
+
     const bookmark = await this.bookmarkRepository.findOne({
       where: { discussionId, userId },
     });
@@ -382,12 +442,23 @@ export class DiscussionService {
         authorId: discussion.authorId,
       },
     );
+
+    this.logger.debug(`Successfully unbookmarked discussion ${discussionId} for user ${userId}`);
   }
+
+  /**
+   * Get user's bookmarked discussions with pagination
+   * @param userId - User ID
+   * @param searchDto - Search and pagination parameters
+   * @returns Paginated list of bookmarked discussions
+   */
 
   async getBookmarkedDiscussions(
     userId: number,
     searchDto: SearchDiscussionDto,
   ): Promise<Pageable<DiscussionResponseDto>> {
+    this.logger.debug(`Getting bookmarked discussions for user: ${userId}`);
+
     try {
       const { page = 1, limit = 10, sortBy = 'createdAt', sortOrder = 'DESC' } = searchDto;
       const offset = (page - 1) * limit;
@@ -419,12 +490,22 @@ export class DiscussionService {
         return formatted;
       });
 
-      return this.createPaginatedResponse(responseItems, totalItems, page, limit);
+      const result = this.createPaginatedResponse(responseItems, totalItems, page, limit);
+      this.logger.debug(`Found ${discussions.length} bookmarked discussions out of ${totalItems} total`);
+
+      return result;
     } catch (error) {
+      this.logger.error(`Error getting bookmarked discussions for user ${userId}:`, error);
       throw error;
     }
   }
 
+  /**
+   * Check if a discussion is bookmarked by a user
+   * @param discussionId - Discussion ID
+   * @param userId - User ID
+   * @returns Whether the discussion is bookmarked
+   */
   async isDiscussionBookmarked(discussionId: number, userId: number): Promise<boolean> {
     const bookmark = await this.bookmarkRepository.findOne({
       where: { discussionId, userId },
@@ -432,7 +513,14 @@ export class DiscussionService {
     return !!bookmark;
   }
 
-  // ------ Tag Operations ------
+  // ==================== TAG OPERATIONS ====================
+
+  /**
+   * Get popular tags with pagination
+   * @param page - Page number
+   * @param limit - Items per page
+   * @returns Paginated list of popular tags
+   */
 
   async getPopularTags(page: number = 1, limit: number = 10): Promise<Pageable<PopularTagsResponseDto>> {
     // For pagination parameters
@@ -481,8 +569,15 @@ export class DiscussionService {
     };
   }
 
-  // ------ Other Operations ------
+  // ==================== DISCUSSION STATISTICS ====================
 
+  /**
+   * Get discussion entity by ID with optional relations
+   * @param id - Discussion ID
+   * @param relations - Relations to load
+   * @returns Discussion entity
+   * @throws NotFoundException if discussion not found
+   */
   async getDiscussionEntity(id: number, relations: string[] = []): Promise<Discussion> {
     const discussion = await this.discussionRepository.findOne({
       where: { id },
@@ -496,67 +591,104 @@ export class DiscussionService {
     return discussion;
   }
 
+  /**
+   * Increment comment count for a discussion
+   * @param id - Discussion ID
+   * @param entityManager - Optional entity manager for transaction
+   */
   async incrementCommentCount(id: number, entityManager?: EntityManager): Promise<void> {
     const manager = entityManager || this.discussionRepository.manager;
     await manager.increment(Discussion, { id }, 'commentCount', 1);
   }
 
+  /**
+   * Decrement comment count for a discussion
+   * @param id - Discussion ID
+   * @param entityManager - Optional entity manager for transaction
+   */
   async decrementCommentCount(id: number, entityManager?: EntityManager): Promise<void> {
     const manager = entityManager || this.discussionRepository.manager;
     const discussion = await manager.findOne(Discussion, { where: { id } });
 
-    if (!discussion) {
-      throw new NotFoundException(`Discussion with ID ${id} not found`);
+    if (discussion && discussion.commentCount > 0) {
+      await manager.decrement(Discussion, { id }, 'commentCount', 1);
     }
-
-    const newCount = Math.max(0, discussion.commentCount - 1);
-    await manager.update(Discussion, { id }, { commentCount: newCount });
   }
 
+  /**
+   * Increment upvote count for a discussion
+   * @param id - Discussion ID
+   * @param entityManager - Optional entity manager for transaction
+   */
   async incrementUpvoteCount(id: number, entityManager?: EntityManager): Promise<void> {
     const manager = entityManager || this.discussionRepository.manager;
     await manager.increment(Discussion, { id }, 'upvoteCount', 1);
   }
 
+  /**
+   * Decrement upvote count for a discussion
+   * @param id - Discussion ID
+   * @param entityManager - Optional entity manager for transaction
+   */
   async decrementUpvoteCount(id: number, entityManager?: EntityManager): Promise<void> {
     const manager = entityManager || this.discussionRepository.manager;
     const discussion = await manager.findOne(Discussion, { where: { id } });
 
-    if (!discussion) {
-      throw new NotFoundException(`Discussion with ID ${id} not found`);
+    if (discussion && discussion.upvoteCount > 0) {
+      await manager.decrement(Discussion, { id }, 'upvoteCount', 1);
     }
-
-    const newCount = Math.max(0, discussion.upvoteCount - 1);
-    await manager.update(Discussion, { id }, { upvoteCount: newCount });
   }
 
+  /**
+   * Increment downvote count for a discussion
+   * @param id - Discussion ID
+   * @param entityManager - Optional entity manager for transaction
+   */
   async incrementDownvoteCount(id: number, entityManager?: EntityManager): Promise<void> {
     const manager = entityManager || this.discussionRepository.manager;
     await manager.increment(Discussion, { id }, 'downvoteCount', 1);
   }
 
+  /**
+   * Decrement downvote count for a discussion
+   * @param id - Discussion ID
+   * @param entityManager - Optional entity manager for transaction
+   */
   async decrementDownvoteCount(id: number, entityManager?: EntityManager): Promise<void> {
     const manager = entityManager || this.discussionRepository.manager;
     const discussion = await manager.findOne(Discussion, { where: { id } });
 
-    if (!discussion) {
-      throw new NotFoundException(`Discussion with ID ${id} not found`);
+    if (discussion && discussion.downvoteCount > 0) {
+      await manager.decrement(Discussion, { id }, 'downvoteCount', 1);
     }
-
-    const newCount = Math.max(0, discussion.downvoteCount - 1);
-    await manager.update(Discussion, { id }, { downvoteCount: newCount });
   }
 
+  /**
+   * Get total count of discussions
+   * @returns Total number of discussions
+   */
   async countTotal(): Promise<number> {
     return this.discussionRepository.count();
   }
 
+  /**
+   * Count discussions by date range
+   * @param start - Start date
+   * @param end - End date
+   * @returns Number of discussions in the date range
+   */
   async countByDateRange(start: Date, end: Date): Promise<number> {
     return this.discussionRepository.count({
       where: { createdAt: Between(start, end) },
     });
   }
 
+  /**
+   * Get time series data for discussions
+   * @param start - Start date
+   * @param end - End date
+   * @returns Array of date/count pairs
+   */
   async getTimeSeries(start: Date, end: Date): Promise<{ date: string; count: string }[]> {
     return this.discussionRepository
       .createQueryBuilder('discussion')
@@ -571,7 +703,97 @@ export class DiscussionService {
       .getRawMany();
   }
 
-  // ------ Helper Methods ------
+  // ==================== VALIDATION METHODS ====================
+
+  /**
+   * Validate discussion creation data
+   * @param createDto - Discussion creation data
+   * @param files - Optional file attachments
+   */
+  private async validateDiscussionCreationData(
+    createDto: CreateDiscussionDto,
+    files?: Express.Multer.File[],
+  ): Promise<void> {
+    if (!createDto.content || createDto.content.trim().length === 0) {
+      throw new BadRequestException('Discussion content is required');
+    }
+
+    if (createDto.content.length > DiscussionService.MAX_CONTENT_LENGTH) {
+      throw new BadRequestException(
+        `Discussion content must not exceed ${DiscussionService.MAX_CONTENT_LENGTH} characters`,
+      );
+    }
+
+    if (createDto.tags && createDto.tags.length > DiscussionService.MAX_TAGS_COUNT) {
+      throw new BadRequestException(`Maximum ${DiscussionService.MAX_TAGS_COUNT} tags allowed`);
+    }
+  }
+
+  /**
+   * Validate that a space exists
+   * @param spaceId - Space ID to validate
+   */
+  private async validateSpaceExists(spaceId: number): Promise<void> {
+    const space = await this.spaceRepository.findOne({
+      where: { id: spaceId },
+    });
+
+    if (!space) {
+      throw new NotFoundException(`Discussion space with ID ${spaceId} not found`);
+    }
+  }
+
+  /**
+   * Record discussion-related analytics activity
+   * @param userId - User ID
+   * @param activityType - Type of activity
+   * @param discussion - Discussion entity
+   * @param metadata - Additional metadata
+   */
+  private async recordDiscussionActivity(
+    userId: number,
+    activityType: ActivityType,
+    discussion: Discussion,
+    metadata: Record<string, any> = {},
+  ): Promise<void> {
+    await this.analyticService.recordActivity(userId, activityType, ActivityEntityType.DISCUSSION, discussion.id, {
+      spaceId: discussion.spaceId,
+      isAnonymous: discussion.isAnonymous,
+      ...metadata,
+    });
+  }
+
+  /**
+   * Build discussion response items with user-specific data
+   * @param discussions - Array of discussion entities
+   * @param currentUser - Current authenticated user
+   * @returns Array of discussion response DTOs
+   */
+  private async buildDiscussionResponseItems(
+    discussions: Discussion[],
+    currentUser?: User,
+  ): Promise<DiscussionResponseDto[]> {
+    return Promise.all(
+      discussions.map(async (discussion) => {
+        let isBookmarked: boolean = false;
+        let voteStatus: number | null = null;
+
+        if (currentUser) {
+          const [bookmarkStatus, userVote] = await Promise.all([
+            this.isDiscussionBookmarked(discussion.id, currentUser.id),
+            this.voteService.getUserVoteStatus(currentUser.id, VoteEntityType.DISCUSSION, discussion.id),
+          ]);
+
+          isBookmarked = bookmarkStatus;
+          voteStatus = userVote;
+        }
+
+        return DiscussionResponseDto.fromEntity(discussion, currentUser, isBookmarked, voteStatus);
+      }),
+    );
+  }
+
+  // ==================== HELPER METHODS ====================
 
   private async getDiscussionById(id: number): Promise<Discussion> {
     const discussion = await this.discussionRepository.findOne({
