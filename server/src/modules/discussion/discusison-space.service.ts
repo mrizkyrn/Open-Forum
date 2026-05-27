@@ -1,3 +1,16 @@
+/**
+ * Discussion Space Service
+ *
+ * This service handles all business logic related to discussion spaces including:
+ * - CRUD operations for discussion spaces
+ * - Space following/unfollowing functionality
+ * - Popular spaces and search functionality
+ * - File management for space icons and banners
+ *
+ * @author Open Forum Team
+ * @version 1.0.0
+ */
+
 import {
   BadRequestException,
   ConflictException,
@@ -18,7 +31,7 @@ import { CreateDiscussionSpaceDto } from './dto/create-discussion-space.dto';
 import { DiscussionSpaceResponseDto } from './dto/discussion-space-response.dto';
 import { SearchSpaceDto, SpaceSortBy } from './dto/search-space.dto';
 import { UpdateDiscussionSpaceDto } from './dto/update-discussion-space.dto';
-import { DiscussionSpace, SpaceType } from './entities/discussion-space.entity';
+import { DiscussionSpace } from './entities/discussion-space.entity';
 
 @Injectable()
 export class DiscussionSpaceService {
@@ -31,13 +44,27 @@ export class DiscussionSpaceService {
     private readonly analyticService: AnalyticService,
   ) {}
 
-  // ----- Core CRUD Operations -----
+  // ==========================================
+  // CORE CRUD OPERATIONS
+  // ==========================================
 
+  /**
+   * Create a new discussion space
+   * @param createDto - Space creation data
+   * @param currentUser - Current authenticated user
+   * @param files - Optional icon and banner files
+   * @returns Created discussion space
+   * @throws ConflictException if slug already exists
+   * @throws BadRequestException if validation fails
+   */
   async create(
     createDto: CreateDiscussionSpaceDto,
     currentUser: User,
     files?: { icon?: Express.Multer.File[]; banner?: Express.Multer.File[] },
   ): Promise<DiscussionSpaceResponseDto> {
+    this.logger.log(`Creating discussion space: ${createDto.name} for user: ${currentUser.id}`);
+
+    // Check for duplicate slug
     const existingSpace = await this.spaceRepository.findOne({ where: { slug: createDto.slug } });
     if (existingSpace) {
       throw new ConflictException(`Space with slug "${createDto.slug}" already exists`);
@@ -79,19 +106,27 @@ export class DiscussionSpaceService {
       await queryRunner.manager.save(DiscussionSpace, savedSpace);
       await queryRunner.commitTransaction();
 
+      this.logger.log(`Successfully created discussion space with ID: ${savedSpace.id}`);
       return DiscussionSpaceResponseDto.fromEntity(savedSpace, false);
     } catch (error) {
       this.logger.error(`Failed to create discussion space: ${error.message}`, error.stack);
       await queryRunner.rollbackTransaction();
       await this.cleanupFiles(iconUrl, bannerUrl);
-
       throw error;
     } finally {
       await queryRunner.release();
     }
   }
 
+  /**
+   * Get all discussion spaces with filtering and pagination
+   * @param searchDto - Search and pagination parameters
+   * @param currentUser - Current authenticated user (optional)
+   * @returns Paginated list of discussion spaces
+   */
   async findAll(searchDto: SearchSpaceDto, currentUser?: User): Promise<Pageable<DiscussionSpaceResponseDto>> {
+    this.logger.log(`Fetching discussion spaces with filters: ${JSON.stringify(searchDto)}`);
+
     try {
       const { page, limit } = searchDto;
       const offset = (page - 1) * limit;
@@ -105,14 +140,26 @@ export class DiscussionSpaceService {
         return DiscussionSpaceResponseDto.fromEntity(space, isFollowing);
       });
 
-      return this.createPaginatedResponse(formattedSpaces, totalItems, page, limit);
+      const result = this.createPaginatedResponse(formattedSpaces, totalItems, page, limit);
+      this.logger.log(`Successfully fetched ${formattedSpaces.length} spaces out of ${totalItems} total`);
+
+      return result;
     } catch (error) {
       this.logger.error(`Failed to fetch discussion spaces: ${error.message}`, error.stack);
       throw error;
     }
   }
 
+  /**
+   * Get a discussion space by ID
+   * @param id - Space ID
+   * @param currentUser - Current authenticated user (optional)
+   * @returns Discussion space details
+   * @throws NotFoundException if space not found
+   */
   async findById(id: number, currentUser?: User): Promise<DiscussionSpaceResponseDto> {
+    this.logger.log(`Fetching discussion space with ID: ${id}`);
+
     try {
       const space = await this.getSpaceWithFollowers(id);
       const isFollowing = currentUser ? space.followers.some((follower) => follower.id === currentUser.id) : false;
@@ -124,7 +171,16 @@ export class DiscussionSpaceService {
     }
   }
 
+  /**
+   * Get a discussion space by slug
+   * @param slug - Space slug
+   * @param currentUser - Current authenticated user (optional)
+   * @returns Discussion space details
+   * @throws NotFoundException if space not found
+   */
   async findBySlug(slug: string, currentUser?: User): Promise<DiscussionSpaceResponseDto> {
+    this.logger.log(`Fetching discussion space with slug: ${slug}`);
+
     try {
       const space = await this.spaceRepository.findOne({
         where: { slug },
@@ -143,12 +199,26 @@ export class DiscussionSpaceService {
     }
   }
 
+  /**
+   * Update a discussion space
+   * @param id - Space ID
+   * @param updateDto - Update data
+   * @param currentUser - Current authenticated user
+   * @param files - Optional icon and banner files
+   * @returns Updated discussion space
+   * @throws NotFoundException if space not found
+   * @throws ForbiddenException if user is not the creator
+   * @throws BadRequestException if no fields to update
+   * @throws ConflictException if new slug already exists
+   */
   async update(
     id: number,
     updateDto: UpdateDiscussionSpaceDto,
     currentUser: User,
     files?: { icon?: Express.Multer.File[]; banner?: Express.Multer.File[] },
   ): Promise<DiscussionSpaceResponseDto> {
+    this.logger.log(`Updating discussion space ${id} for user: ${currentUser.id}`);
+
     // Validate input if no fields are provided
     if (
       !updateDto.name &&
@@ -195,6 +265,7 @@ export class DiscussionSpaceService {
       // Check if current user is following
       const isFollowing = space.followers.some((follower) => follower.id === currentUser.id);
 
+      this.logger.log(`Successfully updated discussion space with ID: ${space.id}`);
       return DiscussionSpaceResponseDto.fromEntity(space, isFollowing);
     } catch (error) {
       await queryRunner.rollbackTransaction();
@@ -205,7 +276,17 @@ export class DiscussionSpaceService {
     }
   }
 
+  /**
+   * Delete a discussion space
+   * @param id - Space ID
+   * @param currentUser - Current authenticated user
+   * @throws NotFoundException if space not found
+   * @throws ForbiddenException if user is not the creator
+   * @throws BadRequestException if space has existing discussions
+   */
   async delete(id: number, currentUser: User): Promise<void> {
+    this.logger.log(`Deleting discussion space ${id} for user: ${currentUser.id}`);
+
     try {
       const space = await this.spaceRepository.findOne({
         where: { id },
@@ -241,6 +322,8 @@ export class DiscussionSpaceService {
         // Delete the space
         await queryRunner.manager.remove(space);
         await queryRunner.commitTransaction();
+
+        this.logger.log(`Successfully deleted discussion space with ID: ${id}`);
       } catch (error) {
         await queryRunner.rollbackTransaction();
         throw error;
@@ -253,15 +336,26 @@ export class DiscussionSpaceService {
     }
   }
 
-  // ----- Following Operations -----
+  // ==========================================
+  // SPACE FOLLOWING OPERATIONS
+  // ==========================================
 
+  /**
+   * Follow a discussion space
+   * @param spaceId - Space ID
+   * @param userId - User ID
+   * @throws NotFoundException if space or user not found
+   */
   async followSpace(spaceId: number, userId: number): Promise<void> {
+    this.logger.log(`User ${userId} following space ${spaceId}`);
+
     try {
       const space = await this.getSpaceWithFollowers(spaceId);
 
       // Check if already following
       const isFollowing = space.followers.some((follower) => follower.id === userId);
       if (isFollowing) {
+        this.logger.log(`User ${userId} already following space ${spaceId}`);
         return;
       }
 
@@ -283,16 +377,22 @@ export class DiscussionSpaceService {
         await queryRunner.commitTransaction();
 
         // Record follow activity - non-blocking
-        await this.analyticService.recordActivity(
-          userId,
-          ActivityType.FOLLOW_SPACE,
-          ActivityEntityType.DISCUSSION_SPACE,
-          spaceId,
-          {
-            spaceName: space.name,
-            spaceSlug: space.slug,
-          },
-        );
+        try {
+          await this.analyticService.recordActivity(
+            userId,
+            ActivityType.FOLLOW_SPACE,
+            ActivityEntityType.DISCUSSION_SPACE,
+            spaceId,
+            {
+              spaceName: space.name,
+              spaceSlug: space.slug,
+            },
+          );
+        } catch (analyticsError) {
+          this.logger.warn('Failed to record follow activity', analyticsError);
+        }
+
+        this.logger.log(`User ${userId} successfully followed space ${spaceId}`);
       } catch (error) {
         await queryRunner.rollbackTransaction();
         throw error;
@@ -305,12 +405,21 @@ export class DiscussionSpaceService {
     }
   }
 
+  /**
+   * Unfollow a discussion space
+   * @param spaceId - Space ID
+   * @param userId - User ID
+   * @throws NotFoundException if space not found
+   */
   async unfollowSpace(spaceId: number, userId: number): Promise<void> {
+    this.logger.log(`User ${userId} unfollowing space ${spaceId}`);
+
     const space = await this.getSpaceWithFollowers(spaceId);
 
     // Check if already not following
     const followerIndex = space.followers.findIndex((follower) => follower.id === userId);
     if (followerIndex === -1) {
+      this.logger.log(`User ${userId} not following space ${spaceId}`);
       return;
     }
 
@@ -327,24 +436,37 @@ export class DiscussionSpaceService {
       await queryRunner.commitTransaction();
 
       // Record unfollow activity
-      await this.analyticService.recordActivity(
-        userId,
-        ActivityType.UNFOLLOW_SPACE,
-        ActivityEntityType.DISCUSSION_SPACE,
-        spaceId,
-        {
-          spaceName: space.name,
-          spaceSlug: space.slug,
-        },
-      );
+      try {
+        await this.analyticService.recordActivity(
+          userId,
+          ActivityType.UNFOLLOW_SPACE,
+          ActivityEntityType.DISCUSSION_SPACE,
+          spaceId,
+          {
+            spaceName: space.name,
+            spaceSlug: space.slug,
+          },
+        );
+      } catch (analyticsError) {
+        this.logger.warn('Failed to record unfollow activity', analyticsError);
+      }
+
+      this.logger.log(`User ${userId} successfully unfollowed space ${spaceId}`);
     } catch (error) {
       await queryRunner.rollbackTransaction();
+      this.logger.error(`Failed to unfollow space: ${error.message}`, error.stack);
       throw new InternalServerErrorException('Failed to unfollow space');
     } finally {
       await queryRunner.release();
     }
   }
 
+  /**
+   * Check if user is following a space
+   * @param spaceId - Space ID
+   * @param userId - User ID
+   * @returns Boolean indicating following status
+   */
   async isFollowing(spaceId: number, userId: number): Promise<boolean> {
     try {
       const count = await this.spaceRepository
@@ -361,13 +483,24 @@ export class DiscussionSpaceService {
     }
   }
 
-  // ----- Popular Spaces -----
+  // ==========================================
+  // POPULAR SPACES AND STATISTICS
+  // ==========================================
 
+  /**
+   * Get popular discussion spaces ordered by follower count
+   * @param limit - Maximum number of spaces to return
+   * @param currentUser - Current authenticated user (optional)
+   * @returns Array of popular discussion spaces
+   */
   async getPopularSpaces(limit: number, currentUser?: User): Promise<DiscussionSpaceResponseDto[]> {
+    this.logger.log(`Fetching ${limit} popular spaces`);
+
     try {
       const spaces = await this.spaceRepository
         .createQueryBuilder('space')
         .orderBy('space.followerCount', 'DESC')
+        .addOrderBy('space.createdAt', 'DESC')
         .take(limit)
         .getMany();
 
@@ -383,6 +516,7 @@ export class DiscussionSpaceService {
         }),
       );
 
+      this.logger.log(`Successfully fetched ${formattedSpaces.length} popular spaces`);
       return formattedSpaces;
     } catch (error) {
       this.logger.error(`Failed to fetch popular spaces: ${error.message}`, error.stack);
@@ -390,8 +524,18 @@ export class DiscussionSpaceService {
     }
   }
 
-  // ----- Helper Methods -----
+  // ==========================================
+  // VALIDATION METHODS
+  // ==========================================
 
+  /**
+   * Build search query with filters and pagination
+   * @param searchDto - Search parameters
+   * @param offset - Pagination offset
+   * @param limit - Pagination limit
+   * @param currentUser - Current authenticated user
+   * @returns Query builder instance
+   */
   private buildSpaceSearchQuery(searchDto: SearchSpaceDto, offset: number, limit: number, currentUser?: User) {
     const { sortBy = 'createdAt', sortOrder = 'DESC' } = searchDto;
 
@@ -439,6 +583,12 @@ export class DiscussionSpaceService {
     return queryBuilder;
   }
 
+  /**
+   * Get space entity with followers relation
+   * @param id - Space ID
+   * @returns Space entity with followers
+   * @throws NotFoundException if space not found
+   */
   private async getSpaceWithFollowers(id: number): Promise<DiscussionSpace> {
     const space = await this.spaceRepository.findOne({
       where: { id },
@@ -452,12 +602,25 @@ export class DiscussionSpaceService {
     return space;
   }
 
+  /**
+   * Verify if user is the creator of the space
+   * @param space - Discussion space entity
+   * @param userId - User ID to verify
+   * @throws ForbiddenException if user is not the creator
+   */
   private verifyCreator(space: DiscussionSpace, userId: number): void {
     if (space.creatorId !== userId) {
       throw new ForbiddenException('Only the creator can modify this space');
     }
   }
 
+  /**
+   * Validate that a slug is unique (excluding current space if updating)
+   * @param newSlug - New slug to validate
+   * @param currentSlug - Current slug (for updates)
+   * @param spaceId - Space ID (for updates)
+   * @throws ConflictException if slug already exists
+   */
   private async validateSlugUniqueness(newSlug?: string, currentSlug?: string, spaceId?: number): Promise<void> {
     if (newSlug && newSlug !== currentSlug) {
       const existingSpace = await this.spaceRepository.findOne({ where: { slug: newSlug } });
@@ -468,6 +631,16 @@ export class DiscussionSpaceService {
     }
   }
 
+  // ==========================================
+  // HELPER METHODS
+  // ==========================================
+
+  /**
+   * Update space icon or banner image
+   * @param space - Discussion space entity
+   * @param type - Image type ('icon' or 'banner')
+   * @param file - New image file
+   */
   private async updateSpaceImage(
     space: DiscussionSpace,
     type: 'icon' | 'banner',
@@ -491,6 +664,11 @@ export class DiscussionSpaceService {
     }
   }
 
+  /**
+   * Remove space icon or banner image
+   * @param space - Discussion space entity
+   * @param type - Image type ('icon' or 'banner')
+   */
   private async removeSpaceImage(space: DiscussionSpace, type: 'icon' | 'banner'): Promise<void> {
     // Get current URL
     const currentUrl = type === 'icon' ? space.iconUrl : space.bannerUrl;
@@ -508,6 +686,11 @@ export class DiscussionSpaceService {
     }
   }
 
+  /**
+   * Clean up uploaded files in case of error
+   * @param iconUrl - Icon file URL to cleanup
+   * @param bannerUrl - Banner file URL to cleanup
+   */
   private async cleanupFiles(iconUrl?: string | null, bannerUrl?: string | null): Promise<void> {
     try {
       if (iconUrl) {
@@ -522,6 +705,14 @@ export class DiscussionSpaceService {
     }
   }
 
+  /**
+   * Create paginated response with metadata
+   * @param items - Array of items
+   * @param totalItems - Total number of items
+   * @param page - Current page number
+   * @param limit - Items per page
+   * @returns Paginated response object
+   */
   private createPaginatedResponse<T>(items: T[], totalItems: number, page: number, limit: number): Pageable<T> {
     const totalPages = Math.ceil(totalItems / limit);
 
