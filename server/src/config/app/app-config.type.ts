@@ -3,6 +3,7 @@ export type AppConfig = {
   port: number;
   apiPrefix: string;
   clientUrl: string;
+  uploadDir: string;
   cors: {
     origin: string;
     credentials: boolean;

@@ -6,6 +6,7 @@ export const appConfig = registerAs('app', (): AppConfig => {
   const port = process.env.PORT;
   const apiPrefix = process.env.API_PREFIX;
   const clientUrl = process.env.CLIENT_URL;
+  const uploadDir = process.env.UPLOAD_DIR;
   const corsOrigin = process.env.CORS_ORIGIN;
   const corsCredentials = process.env.CORS_CREDENTIALS === 'true';
 
@@ -30,6 +31,10 @@ export const appConfig = registerAs('app', (): AppConfig => {
     throw new Error('App configuration is incomplete. Required environment variables: CLIENT_URL');
   }
 
+  if (!uploadDir) {
+    throw new Error('App configuration is incomplete. Required environment variables: UPLOAD_DIR');
+  }
+
   if (!corsOrigin) {
     throw new Error('App configuration is incomplete. Required environment variables: CORS_ORIGIN');
   }
@@ -39,6 +44,7 @@ export const appConfig = registerAs('app', (): AppConfig => {
     port: portNumber,
     apiPrefix,
     clientUrl,
+    uploadDir: uploadDir,
     cors: {
       origin: corsOrigin,
       credentials: corsCredentials,

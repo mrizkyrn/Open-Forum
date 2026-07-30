@@ -1,6 +1,8 @@
-import { Injectable, BadRequestException, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, BadRequestException, InternalServerErrorException, Inject } from '@nestjs/common';
+import { ConfigType } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
+import { appConfig } from '../../config';
 import { v4 as uuidv4 } from 'uuid';
 
 export enum FileType {
@@ -23,8 +25,11 @@ interface FileUploadOptions {
 export class FileService {
   private readonly uploadDir: string;
 
-  constructor() {
-    this.uploadDir = path.join(process.cwd(), 'uploads');
+  constructor(
+    @Inject(appConfig.KEY)
+    private readonly appConfigService: ConfigType<typeof appConfig>,
+  ) {
+    this.uploadDir = this.appConfigService.uploadDir || path.join(process.cwd(), 'uploads');
     this.ensureDirectoryExists(this.uploadDir);
   }
 
